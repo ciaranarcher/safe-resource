@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -23,7 +25,7 @@ type Resource struct {
 	AccountID  string `json:"account_id"`
 	Available  bool   `json:"available"`
 	Status     string `json:"status"`
-	NumCalls   int64  `json:"num_calls"`
+	NumCalls   int    `json:"num_calls"`
 }
 
 func main() {
@@ -33,6 +35,9 @@ func main() {
 	svc := dynamodb.New(sess)
 
 	load := flag.Bool("l", false, "load dynamo with generated records")
+	safe := flag.Bool("s", false, "use a safe conditional write to dynamo")
+
+	flag.Parse()
 
 	if *load {
 		fmt.Println("loading tables with data...")
@@ -40,17 +45,140 @@ func main() {
 		if err != nil {
 			fmt.Println("Error loading the table:", err)
 		}
+		return
 	}
 
-	// Read an item by key
-	err := readItem(svc, "100")
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+
+		go func(resourceID string, routineID int) {
+			t := time.Now()
+			numReadErrs := 0
+			numWriteErrs := 0
+			numWrites := 0
+			// Decrement the counter when the goroutine completes.
+			defer wg.Done()
+			// Do work
+			// Read an agent
+			for numWrites < 20 {
+				item, err := readAgent(svc, resourceID)
+				if err != nil {
+					fmt.Println("Error reading the agent:", err)
+					numReadErrs = numReadErrs + 1
+					continue
+				}
+
+				err = incrementCalls(svc, item, *safe)
+				if err != nil {
+					numWriteErrs = numWriteErrs + 1
+					continue
+				} else {
+					numWrites = numWrites + 1
+				}
+			}
+
+			elapsed := time.Since(t)
+
+			msg := fmt.Sprintln("routine ", routineID, " writes:", numWrites, " read errs: ", numReadErrs, " write errs: ", numWriteErrs, " elapsed: ", elapsed)
+			fmt.Printf(msg)
+		}("100", i)
+
+	}
+	// Wait for all groups to complete
+	wg.Wait()
+
+	// Read an agent
+	agent, err := readAgent(svc, "100")
 	if err != nil {
 		fmt.Println("Error reading the table:", err)
+		return
 	}
+
+	fmt.Println("Final state:")
+	fmt.Println("ResourceID:  ", agent.ResourceID)
+	fmt.Println("AccountID:  ", agent.AccountID)
+	fmt.Println("Status: ", agent.Status)
+	fmt.Println("Num calls:  ", agent.NumCalls)
 
 }
 
-func readItem(svc *dynamodb.DynamoDB, resourceID string) error {
+type numCallsCondition struct {
+	NumCalls int `json:":num_calls"`
+}
+
+func incrementCalls(svc *dynamodb.DynamoDB, item *Resource, safeUpdate bool) error {
+	var input *dynamodb.PutItemInput
+
+	if safeUpdate {
+		conditionalExp := aws.String("num_calls = :num_calls")
+
+		condition, err := dynamodbattribute.MarshalMap(numCallsCondition{
+			NumCalls: item.NumCalls,
+		})
+
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
+
+		input = &dynamodb.PutItemInput{
+			Item: map[string]*dynamodb.AttributeValue{
+				"resource_id": {
+					S: aws.String(item.ResourceID),
+				},
+				"account_id": {
+					S: aws.String(item.AccountID),
+				},
+				"available": {
+					BOOL: aws.Bool(item.Available),
+				},
+				"status": {
+					S: aws.String(item.Status),
+				},
+				"num_calls": {
+					// Add one and convert to string for writing
+					N: aws.String(strconv.Itoa(item.NumCalls + 1)),
+				}},
+			ReturnConsumedCapacity:    aws.String("TOTAL"),
+			TableName:                 aws.String(Table),
+			ConditionExpression:       conditionalExp,
+			ExpressionAttributeValues: condition,
+		}
+	} else {
+
+		input = &dynamodb.PutItemInput{
+			Item: map[string]*dynamodb.AttributeValue{
+				"resource_id": {
+					S: aws.String(item.ResourceID),
+				},
+				"account_id": {
+					S: aws.String(item.AccountID),
+				},
+				"available": {
+					BOOL: aws.Bool(item.Available),
+				},
+				"status": {
+					S: aws.String(item.Status),
+				},
+				"num_calls": {
+					// Add one and convert to string for writing
+					N: aws.String(strconv.Itoa(item.NumCalls + 1)),
+				}},
+			ReturnConsumedCapacity: aws.String("TOTAL"),
+			TableName:              aws.String(Table),
+		}
+	}
+
+	_, err := svc.PutItem(input)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func readAgent(svc *dynamodb.DynamoDB, resourceID string) (*Resource, error) {
 	result, err := svc.GetItem(&dynamodb.GetItemInput{
 		TableName: aws.String(Table),
 		Key: map[string]*dynamodb.AttributeValue{
@@ -65,7 +193,7 @@ func readItem(svc *dynamodb.DynamoDB, resourceID string) error {
 
 	if err != nil {
 		fmt.Println(err.Error())
-		return err
+		return nil, err
 	}
 
 	r := Resource{}
@@ -76,25 +204,13 @@ func readItem(svc *dynamodb.DynamoDB, resourceID string) error {
 		panic(fmt.Sprintf("Failed to unmarshal Record, %v", err))
 	}
 
-	// if item.Title == "" {
-	// 	fmt.Println("Could not find the resource with ID ", resourceID)
-	// 	return err
-	// }
-
-	fmt.Println("Found item:")
-	fmt.Println("ResourceID:  ", r.ResourceID)
-	fmt.Println("AccountID:  ", r.AccountID)
-	fmt.Println("Status: ", r.Status)
-	fmt.Println("Num calls:  ", r.NumCalls)
-
-	return nil
+	return &r, nil
 }
 
 func loadTable(svc *dynamodb.DynamoDB) error {
 	var resources []Resource
 
 	for i := 0; i < 5; i++ {
-		time.Sleep(time.Millisecond * 5) // make sure we have some slew in timestamps
 
 		resource := Resource{
 			ResourceID: fmt.Sprintf("%d", 100+i),
