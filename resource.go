@@ -61,7 +61,7 @@ func main() {
 			defer wg.Done()
 			// Do work
 			// Read an agent
-			for numWrites < 20 {
+			for numWrites < 10 {
 				item, err := readAgent(svc, resourceID)
 				if err != nil {
 					fmt.Println("Error reading the agent:", err)
